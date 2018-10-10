@@ -1,0 +1,11 @@
+BODY { margin: auto; width: 60em; font-family: helvetica, sans-serif}
+table.pattern, table.pattern2 {text-align: center; display: inline; }
+table.pattern2 CAPTION {font-style: italic; background: lightgreen;}
+table.pattern2 TH {background: gray;}
+table.pattern2 TD {width: 2em;}
+
+table.pattern TH {background: gray;}
+table.pattern CAPTION {font-style: italic; background: lightblue;}
+table.pattern TD {width: 2em;}
+table.pattern TD.odd {padding-right: 0.5em;}
+

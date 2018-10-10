@@ -1,0 +1,207 @@
+# -*- org-export-html-style-extra: "<link rel='stylesheet' type='text/css' href='style.css'>" -*-
+
+Microbenchmarking Unified Memory in CUDA 6.0
+
+#+name: summ
+#+begin_src sh :var opts="" infile="" :exports none :results output html
+./summ.py $infile
+#+end_src
+
+#+name: grf
+#+begin_src sh :var infile="" :exports none :results file
+outfile=`basename $infile .cu`
+./makegrf.py $infile ${outfile}.dot && dot -Tpng ${outfile}.dot > ${outfile}.png
+echo ${outfile}.png
+#+end_src
+
+* Introduction
+
+  CUDA 6.0 introduced [[http://devblogs.nvidia.com/parallelforall/unified-memory-in-cuda-6/][/Unified Memory/]], a new feature that makes it easier to write CUDA programs by automating data transfers between the CPU and GPU.
+  A key problem with any automated data transfer solution is that it can introduce /redundant/ transfers. 
+  We studied this problem in our [[http://dl.acm.org/citation.cfm?id=2370816.2370824&coll=DL&dl=GUIDE&CFID=374283105&CFTOKEN=50580172][PACT 2012 paper]] and concluded that redundant transfers can only be minimized by maintaining /full/ runtime coherence status on both the CPU and GPU.
+
+  In this document, I evaluate CUDA 6.0's Unified Memory (UM) mechanism on a Kepler K20Xm using a number of microbenchmarks derived from our previous work. 
+  These microbenchmarks are described in the sections below and [[file:um-ubmks.tar.bz2][the source code]] is also available for download.
+  Using these microbenchmarks, I find that UM can introduce redundant transfers in common usage patterns.
+
+  The microbenchmarks show that:
+  - UM assumes that the GPU always has non-stale (i.e. "freshest") data. This leads to redundant /non-stale/ to /non-stale/ transfers from the GPU to the CPU.
+  - UM does not check if the GPU actually needs the data being transferred from the CPU. This leads to potentially redundant eager transfers.
+
+  In the style of Table 1 in our paper, UM can be summarized as:
+
+|-------------+--------------------------+------------+----------------+------------|
+| Scheme      | Only Non-stale to  Stale |            | Prevents Eager |            |
+|-------------+--------------------------+------------+----------------+------------|
+|             | CPU-to-GPU               | GPU-to-CPU | CPU-to-GPU     | GPU-to-CPU |
+|-------------+--------------------------+------------+----------------+------------|
+| CUDA 6.0 UM | Y                        | [[nokernel][N]]          | [[multivars][N]]              | Y          |
+|-------------+--------------------------+------------+----------------+------------|
+
+  
+* Setup
+
+  The hardware and software setup used herein is:
+
+#+name: automem
+#+begin_src sh :results output  :exports results
+head -n4 automem.output.txt 
+#+end_src
+
+#+results: automem
+: GPU: Tesla K20Xm (3.5)
+: Managed memory supported: 1
+: Driver: 6000
+: Runtime: 6000
+  
+  We use the nvprof command line profiler to obtain the following statistics:
+  - CPU Page Faults
+  - Bytes transferred from GPU to CPU (DtoH)
+  - Bytes transferred from CPU to GPU (HtoD)
+
+* Microbenchmarks
+** automem
+   
+   The [[file:automem.cu][automem]] microbenchmark verifies Unified Memory exists and is working correctly. 
+   As the graph below shows, it allocates a Unified Memory variable /y/, initializes it on the CPU, then invokes a kernel that doubles the value of the variable, and finally the CPU prints out the doubled value.
+   All the square boxes in the graph are CPU actions, while ellipses are GPU actions. 
+   The circular SYNC corresponds to a ~cudaDeviceSynchronize()~ call.
+   The labels on the edges are explained below.
+
+#+call: grf(infile="automem.cu") :results file
+
+#+results: grf(infile="automem.cu")
+[[file:automem.png]]
+
+The profiler output for automem is:
+#+call: summ(infile="automem.log") :results html
+
+#+results: summ(infile="automem.log")
+#+BEGIN_HTML
+<table>
+<tr> <th align=left>Unified Memory CPU page faults</th> <td align=right>2</td> </tr>
+<tr> <th align=left>Unified Memory Memcpy DtoH</th> <td align=right>8192</td> </tr>
+<tr> <th align=left>Unified Memory Memcpy HtoD</th> <td align=right>4096</td> </tr>
+</table>
+#+END_HTML
+
+   Each page fault corresponds exactly to a DtoH transfer and are marked in the graph.
+   I assume HtoD transfers only occur on a kernel call.
+   In the graph, the green arrows indicate /required/ transfers while the red dashed arrows indicate /redundant/ transfers.
+   
+   For automem, it is clear that a page has to be transferred from the CPU to the GPU ("HtoD") after initialization since the CPU has the non-stale copy.
+   It is also clear that a page must to be transferred back from the GPU to the CPU ("DtoH") since the GPU modifies the shared variable.
+   This happens when the CPU attempts to print the value of /y/ after the kernel.
+   However, the DtoH that occurs when /y/ is being initialized is not necessary -- neither the GPU nor the CPU have the non-stale copy immediately after the allocation of a Unified Memory variable.
+   This page fault during initialization can only happen if UM assumes that the GPU has a non-stale copy after allocation while the CPU has a stale copy.
+   The nokernel microbenchmark below shows that this is indeed the case.
+   
+** nokernel
+
+   The [[file:nokernel.cu][nokernel]] microbenchmark allocates a Unified Memory variable and initializes it on the CPU. There are no kernel calls.
+
+#+call: grf(infile="nokernel.cu") :results file
+
+#+results: grf(infile="nokernel.cu")
+[[file:nokernel.png]]
+
+The profiler output for nokernel is:
+#+call: summ(infile="nokernel.log") :results html
+
+#+results: summ(infile="nokernel.log")
+#+BEGIN_HTML
+<table>
+<tr> <th align=left>Unified Memory CPU page faults</th> <td align=right>1</td> </tr>
+<tr> <th align=left>Unified Memory Memcpy DtoH</th> <td align=right>4096</td> </tr>
+</table>
+#+END_HTML
+
+   The profiler log shows that nokernel exhibits a page fault /and/ a transfer from the GPU to the CPU.
+   The initial coherence status assigned to the devices is therefore not the same, but the GPU is always assumed to contain the non-stale data initially.
+   Thus, initializing data on the CPU, a very common pattern, will incur redundant data DtoH transfers under UM.
+   Further, as the the next microbenchmark readonly shows, UM /always/ assumes the GPU has a non-stale copy after a kernel call too.
+
+** readonly 
+
+   The [[file:readonly.cu][readonly]] microbenchmark contains a kernel that writes to a Unified Memory variable /conditionally/. In the standard run, the kernel /does not/ write to the Unified Memory variable.
+
+#+call: grf(infile="readonly.cu") :results file
+
+#+results: grf(infile="readonly.cu")
+[[file:readonly.png]]
+
+The profiler output for readonly is:
+#+call: summ(infile="readonly.log") :results html
+
+#+results: summ(infile="readonly.log")
+#+BEGIN_HTML
+<table>
+<tr> <th align=left>Unified Memory CPU page faults</th> <td align=right>2</td> </tr>
+<tr> <th align=left>Unified Memory Memcpy DtoH</th> <td align=right>8192</td> </tr>
+<tr> <th align=left>Unified Memory Memcpy HtoD</th> <td align=right>4096</td> </tr>
+</table>
+#+END_HTML
+
+Since the kernel did not change /y/, there is no need for a DtoH transfer when the CPU reads /y/.
+But as the profiler shows, readonly incurs page faults both during initialization as well as during the read of /y/. 
+So it seems that in UM, a kernel is always assumed to write to Unified Memory variables.
+Therefore, Unified Memory variables that are only read by GPU will incur redundant transfers when accessed by the CPU after a kernel call. 
+Further, as the multivars microbenchmark next shows, there seems to be no hardware ability to detect which variables a GPU kernel reads and/or writes.
+
+** multivars
+
+   The [[file:multivars.cu][multivars]] microbenchmark initializes two Unified Memory variables, /y/ and /z/, where /z/ is not used by the kernel.
+   The variables /y/ and /z/ are sized to span 1 and 160 CPU pages respectively.
+
+#+call: grf(infile="multivars.cu") :results file
+
+#+results: grf(infile="multivars.cu")
+[[file:multivars.png]]
+
+The profiler log for multivars is:
+#+call: summ(infile="multivars.log") :results html
+
+#+results: summ(infile="multivars.log")
+#+BEGIN_HTML
+<table>
+<tr> <th align=left>Unified Memory CPU page faults</th> <td align=right>321</td> </tr>
+<tr> <th align=left>Unified Memory Memcpy DtoH</th> <td align=right>1314816</td> </tr>
+<tr> <th align=left>Unified Memory Memcpy HtoD</th> <td align=right>655360</td> </tr>
+</table>
+#+END_HTML
+
+The log demonstrates that UM transfers all CPU-modified shared data, regardless of whether a GPU kernel actually reads that data.
+Here, the HtoD numbers reflect the redundant eager transfer of /z/'s 160 pages. 
+The DtoH numbers reflect 160 pages of /z/ transferred during initialization and after the kernel call, 160 pages of /z/ + 1 page of /y/.
+
+Since UM supports recursive data structures (like trees, linked lists, etc.), it cannot examine kernel arguments to limit which pages must be transferred.
+
+
+** privmem
+
+   The [[file:privmem.cu][privmem]] microbenchmark exercises an important use-case (GPU private memory) where GPU kernels share some data amongst themselves but the CPU never reads or writes to it.
+   Ideally, we should never see any Unified Memory transfers of such data.
+
+#+call: grf(infile="privmem.cu") :results file
+
+#+results: grf(infile="privmem.cu")
+[[file:privmem.png]]
+
+As expected, the profiler does not log any Unified Memory transfers, so UM does the right thing.
+#+call: summ(infile="privmem.log") :results html
+
+#+results: summ(infile="privmem.log")
+
+* Download
+
+The source code and supporting scripts for the [[file:um-ubmks.tar.bz2][UM microbenchmarks]] is available.
+
+* Conclusions
+
+CUDA 6.0's UM evaluated on a Kepler K20Xm:
+- assumes that the GPU always contains the most up-to-date (non-stale) data
+- transfers all modified data from the CPU to the GPU regardless of whether it will be read, causing redundant eager transfers
+- transfers all data from the GPU to the CPU even if the GPU did not modify the data, causing redundant non-stale to non-stale transfers
+
+Thus, it exhibits redundant transfers.
+
